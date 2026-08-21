@@ -10,6 +10,8 @@
 # Env (global settings):
 # BBS_BASE_URL
 # BBS_USERNAME / BBS_PASSWORD (Bitbucket admin/super admin)
+# BBS_SHARED_HOME (shared home path ON the Bitbucket Server host; defaults to
+#   $BITBUCKET_HOME/shared when BITBUCKET_HOME is set, else the gh bbs2gh default)
 # SSH_USER
 # SSH_PRIVATE_KEY_PATH or SSH_PRIVATE_KEY (raw PEM; should NOT be passphrase-protected)
 # GH_TOKEN/GH_PAT or gh auth login
@@ -67,16 +69,22 @@ logv() { if [[ "$VERBOSE" == "1" ]]; then echo -e "[DEBUG] $*"; fi; }
 if [[ -z "${MAX_CONCURRENT}" || ! "${MAX_CONCURRENT}" =~ ^[0-9]+$ ]]; then
   echo -e "\033[31m[ERROR] --max-concurrent must be an integer\033[0m"; exit 1
 fi
-if [[ "${MAX_CONCURRENT}" -gt 20 ]]; then
-  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 20.\033[0m"
+if [[ "${MAX_CONCURRENT}" -gt 10 ]]; then
+  echo -e "\033[31m[ERROR] Maximum concurrent migrations (${MAX_CONCURRENT}) exceeds the allowed limit of 10.\033[0m"
   exit 1
 fi
 if [[ "${MAX_CONCURRENT}" -lt 1 ]]; then
   echo -e "\033[31m[ERROR] --max-concurrent must be at least 1.\033[0m"; exit 1
 fi
 
-# Normalize CRLF if present (Windows-generated CSV)
-sed -i 's/\r$//' "${CSV_PATH}" 2>/dev/null || true
+# Normalize CRLF if present (Windows-generated CSV) without rewriting the user's file
+if [[ -f "${CSV_PATH}" ]] && LC_ALL=C grep -q $'\r' "${CSV_PATH}" 2>/dev/null; then
+  CSV_NORMALIZED="$(mktemp)"
+  tr -d '\r' < "${CSV_PATH}" > "${CSV_NORMALIZED}"
+  trap 'rm -f "${CSV_NORMALIZED:-}"' EXIT
+  CSV_PATH="${CSV_NORMALIZED}"
+  echo -e "\033[33m[WARNING] CSV has Windows (CRLF) line endings; using a normalized temporary copy.\033[0m"
+fi
 
 if [[ ! -f "${CSV_PATH}" ]]; then
   echo -e "\033[31m[ERROR] CSV file not found: ${CSV_PATH}\033[0m"; exit 1
@@ -89,10 +97,94 @@ else
   OUTPUT_CSV_PATH="${OUTPUT_PATH}"
 fi
 
+if ! command -v gh >/dev/null 2>&1; then
+  echo -e "\033[31m[ERROR] GitHub CLI (gh) is not installed. See https://cli.github.com/\033[0m"
+  exit 1
+fi
+logv "gh version: $(gh --version | head -n 1)"
+if ! gh bbs2gh --version >/dev/null 2>&1; then
+  echo -e "\033[31m[ERROR] Required gh extension 'gh-bbs2gh' is not installed. Install with: gh extension install github/gh-bbs2gh\033[0m"
+  exit 1
+fi
+logv "gh bbs2gh version: $(gh bbs2gh --version 2>/dev/null | head -n 1)"
+
 # gh auth
 if ! gh auth status >/dev/null 2>&1; then
   echo -e "\033[31m[ERROR] GitHub CLI not authenticated. Run: gh auth login (or set GH_TOKEN/GH_PAT).\033[0m"
   exit 1
+fi
+
+detect_bbs_install() {
+  local p launcher bbsHome line detected
+  if [[ -n "${BITBUCKET_HOME:-}" && -d "${BITBUCKET_HOME}" ]]; then
+    export BITBUCKET_HOME
+    echo -e "\033[32m[OK] Bitbucket Server home found via BITBUCKET_HOME: ${BITBUCKET_HOME}\033[0m"
+    return 0
+  fi
+  line="$(ps -ef 2>/dev/null | grep -i '[b]itbucket' | grep -i 'home' | head -n1 || true)"
+  if [[ -n "$line" ]]; then
+    detected="$(printf '%s\n' "$line" | grep -oE 'bitbucket[._]home=[^[:space:]]+' | head -n1 | sed -E 's/^.*home=//' || true)"
+    [[ -z "$detected" ]] && detected="$(printf '%s\n' "$line" | grep -oE '/[^[:space:]]+/bitbucket[^[:space:]]*' | head -n1 || true)"
+    if [[ -n "$detected" ]]; then
+      export BITBUCKET_HOME="$detected"
+      echo -e "\033[32m[OK] Bitbucket Server home auto-detected from running process: ${detected}\033[0m"
+      return 0
+    fi
+  fi
+  for p in /var/atlassian/application-data/bitbucket /opt/atlassian/bitbucket; do
+    if [[ -d "$p" ]]; then
+      export BITBUCKET_HOME="$p"
+      echo -e "\033[32m[OK] Bitbucket Server found at default location: ${p}\033[0m"
+      return 0
+    fi
+  done
+  launcher="$(command -v start-bitbucket.sh 2>/dev/null || command -v bitbucket 2>/dev/null || true)"
+  if [[ -n "$launcher" ]]; then
+    bbsHome="$(cd "$(dirname "$launcher")/.." 2>/dev/null && pwd || dirname "$launcher")"
+    export BITBUCKET_HOME="$bbsHome"
+    echo -e "\033[32m[OK] Bitbucket Server launcher found on PATH: ${launcher} (home: ${bbsHome})\033[0m"
+    return 0
+  fi
+  echo -e "\033[33m[WARNING] Bitbucket Server install not found locally (checked BITBUCKET_HOME, running process, default dirs, PATH). Continuing — remote/SSH migration does not require a local install.\033[0m"
+  return 0
+}
+detect_bbs_install || true
+
+BBS_SHARED_HOME_ARGS=()
+resolve_bbs_shared_home() {
+  local shared="${BBS_SHARED_HOME:-}"
+  if [[ -z "$shared" && -n "${BITBUCKET_HOME:-}" ]]; then
+    local home derived
+    home="${BITBUCKET_HOME%/}"
+    derived="$home"
+    [[ "$derived" == */shared ]] || derived="${derived}/shared"
+    if [[ -d "${derived}/data/migration/export" ]]; then
+      shared="$derived"
+    elif [[ -d "${home}/data/migration/export" ]]; then
+      shared="$home"
+      echo -e "\033[32m[OK] Export directory found directly under BITBUCKET_HOME; using it as the shared home.\033[0m"
+    else
+      shared="$derived"
+    fi
+  fi
+  if [[ -z "$shared" ]]; then
+    echo -e "\033[33m[WARNING] Neither BBS_SHARED_HOME nor BITBUCKET_HOME is set. gh bbs2gh will look for the export archive under its default shared home (/var/atlassian/application-data/bitbucket/shared). Set BBS_SHARED_HOME to the shared home path ON THE BITBUCKET SERVER HOST if your install differs.\033[0m"
+    return 0
+  fi
+  BBS_SHARED_HOME_ARGS=(--bbs-shared-home "$shared")
+  echo -e "\033[32m[OK] Bitbucket shared home passed to gh bbs2gh: ${shared}\033[0m"
+  return 0
+}
+resolve_bbs_shared_home
+
+BBS_SSH_EXTRA_ARGS=()
+if [[ -n "${BBS_SSH_PORT:-}" ]]; then
+  BBS_SSH_EXTRA_ARGS+=(--ssh-port "${BBS_SSH_PORT}")
+  echo -e "\033[32m[OK] Using SSH port ${BBS_SSH_PORT} for archive download.\033[0m"
+fi
+if [[ -n "${BBS_ARCHIVE_DOWNLOAD_HOST:-}" ]]; then
+  BBS_SSH_EXTRA_ARGS+=(--archive-download-host "${BBS_ARCHIVE_DOWNLOAD_HOST}")
+  echo -e "\033[32m[OK] Downloading the export archive from host ${BBS_ARCHIVE_DOWNLOAD_HOST}.\033[0m"
 fi
 
 # BBS env validation
@@ -166,6 +258,14 @@ choose_storage_backend() {
 }
 
 choose_storage_backend
+
+BBS_TLS_ARGS=()
+case "${BBS_DISABLE_SSL_VERIFY:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)
+    BBS_TLS_ARGS+=(--no-ssl-verify)
+    echo -e "\033[33m[WARNING] TLS certificate verification is DISABLED (BBS_DISABLE_SSL_VERIFY set). gh bbs2gh will run with --no-ssl-verify.\033[0m"
+    ;;
+esac
 
 ############################################
 # CSV helpers (robust parsing)
@@ -283,8 +383,6 @@ resolve_key_path() {
     local tmp; tmp="$(mktemp --suffix=.pem)"
     chmod 600 "$tmp"
     printf "%s" "$input" > "$tmp"
-    # Register cleanup so the temp key file is removed when the subshell exits
-    trap 'rm -f "${tmp}"' EXIT
     echo "$tmp"
   elif [[ -z "$input" && -n "${SSH_PRIVATE_KEY_PATH:-}" ]]; then
     echo "$SSH_PRIVATE_KEY_PATH"
@@ -315,6 +413,9 @@ migrate_repository() {
       "$(date)" "${projectKey}" "${bbsRepoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}"
 
     local resolvedKey; resolvedKey="$(resolve_key_path "${SSH_PRIVATE_KEY:-${SSH_PRIVATE_KEY_PATH:-}}")"
+    if [[ -n "${SSH_PRIVATE_KEY:-}" ]]; then
+      trap 'rm -f "${resolvedKey}"' RETURN
+    fi
     if [[ -z "$resolvedKey" || ! -f "$resolvedKey" ]]; then
       printf '[%s] [ERROR] SSH private key path is invalid or missing: %s\n' "$(date)" "${resolvedKey:-<empty>}"
       return 1
@@ -338,6 +439,9 @@ migrate_repository() {
       --github-org "${github_org}" \
       --github-repo "${github_repo}" \
       "${STORAGE_ARGS[@]}" \
+      ${BBS_TLS_ARGS[@]+"${BBS_TLS_ARGS[@]}"} \
+      ${BBS_SHARED_HOME_ARGS[@]+"${BBS_SHARED_HOME_ARGS[@]}"} \
+      ${BBS_SSH_EXTRA_ARGS[@]+"${BBS_SSH_EXTRA_ARGS[@]}"} \
       --ssh-user "${SSH_USER}" \
       --ssh-private-key "${resolvedKey}" \
       --target-api-url "${TARGET_API_URL}" \
@@ -370,6 +474,161 @@ declare -A JOB_LASTLEN=()  # pid -> last printed length
 QUEUE=()
 MIGRATED=()
 FAILED=()
+SKIPPED_LARGE=()
+NOT_FOUND=()
+
+############################################
+# Large-file skip list (from prechecks)
+############################################
+MIGRATE_LARGE_FILE_REPOS_FLAG=false
+case "${MIGRATE_LARGE_FILE_REPOS:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) MIGRATE_LARGE_FILE_REPOS_FLAG=true ;;
+esac
+
+declare -A LARGE_FILE_SKIP=()
+LARGE_FILE_SKIP_TOTAL=0
+
+load_large_file_skip_list() {
+  if [[ "${MIGRATE_LARGE_FILE_REPOS_FLAG}" == true ]]; then
+    echo -e "\033[33m[WARNING] MIGRATE_LARGE_FILE_REPOS is enabled - repos containing large files will be migrated. Ensure Git LFS is configured or migration may fail.\033[0m"
+    return 0
+  fi
+  local f="${LARGE_FILE_REPOS_CSV:-}"
+  if [[ -z "$f" ]]; then
+    f="$(ls -1t large_file_repos-*.csv 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$f" ]]; then
+    local d; d="$(dirname "${CSV_PATH}")"
+    f="$(ls -1t "${d}"/large_file_repos-*.csv 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$f" || ! -f "$f" ]]; then
+    logv "No large-file skip-list found; every repo in the CSV will be attempted."
+    return 0
+  fi
+  local pk rs _rest key
+  while IFS=',' read -r pk rs _rest; do
+    pk="$(strip_quotes "${pk:-}")"; rs="$(strip_quotes "${rs:-}")"
+    [[ -z "$pk" || -z "$rs" || "$pk" == "project_key" ]] && continue
+    key="${pk}/${rs}"
+    if [[ -z "${LARGE_FILE_SKIP[$key]:-}" ]]; then
+      LARGE_FILE_SKIP[$key]=1
+      LARGE_FILE_SKIP_TOTAL=$(( LARGE_FILE_SKIP_TOTAL + 1 ))
+    fi
+  done < "$f"
+  if (( LARGE_FILE_SKIP_TOTAL > 0 )); then
+    echo -e "\033[33m[WARNING] Large-file skip-list loaded from ${f}: ${LARGE_FILE_SKIP_TOTAL} repo(s) will be skipped. Set MIGRATE_LARGE_FILE_REPOS=true to migrate them anyway.\033[0m"
+  fi
+  return 0
+}
+load_large_file_skip_list
+
+############################################
+# Repo slug resolution (gh bbs2gh --bbs-repo expects the slug, not the display name)
+############################################
+BBS_CURL_OPTS=(-sS)
+case "${BBS_DISABLE_SSL_VERIFY:-}" in
+  [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) BBS_CURL_OPTS+=(--insecure) ;;
+esac
+
+bbs_auth_header() {
+  if [[ -n "${BBS_PAT:-}" ]]; then
+    printf 'Authorization: Bearer %s' "$BBS_PAT"
+  else
+    printf 'Authorization: Basic %s' "$(printf '%s:%s' "${BBS_USERNAME}" "${BBS_PASSWORD}" | base64 | tr -d '\n')"
+  fi
+}
+
+bbs_urlencode() { jq -rn --arg v "$1" '$v|@uri'; }
+
+declare -A SLUG_CACHE=()
+
+list_project_repos() {
+  local projectKey="$1" encP start=0 resp out=""
+  encP="$(bbs_urlencode "$projectKey")"
+  while :; do
+    resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    out+="$(printf '%s' "$resp" | jq -r '.values[]?.slug' 2>/dev/null | tr '\n' ' ')"
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+  printf '%s' "${out:-<could not list>}"
+}
+
+WARN_SLUG() { echo -e "\033[33m[WARNING] $*\033[0m" >&2; }
+
+resolve_repo_slug() {
+  local projectKey="$1" value="$2"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  projectKey="${projectKey#"${projectKey%%[![:space:]]*}"}"
+  projectKey="${projectKey%"${projectKey##*[![:space:]]}"}"
+  local key="${projectKey}/${value}"
+  if [[ -n "${SLUG_CACHE[$key]:-}" ]]; then
+    printf '%s' "${SLUG_CACHE[$key]}"
+    return 0
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s' "$value"
+    return 0
+  fi
+
+  local encP encV status probe_body
+  probe_body="$(mktemp)"
+  encP="$(bbs_urlencode "$projectKey")"
+  encV="$(bbs_urlencode "$value")"
+
+  status="$(curl "${BBS_CURL_OPTS[@]}" -o "$probe_body" -w '%{http_code}' \
+    -H "$(bbs_auth_header)" \
+    "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos/${encV}" 2>/dev/null || echo 000)"
+  if [[ "$status" == "200" ]]; then
+    local realSlug; realSlug="$(jq -r '.slug // empty' < "$probe_body" 2>/dev/null || true)"
+    rm -f "$probe_body"
+    if [[ -n "$realSlug" ]]; then
+      if [[ "$realSlug" != "$value" ]]; then
+        WARN_SLUG "'${value}' is a repository NAME, not a slug. Resolved to slug '${realSlug}' for ${projectKey}."
+      fi
+      SLUG_CACHE[$key]="$realSlug"
+      printf '%s' "$realSlug"
+      return 0
+    fi
+  fi
+  rm -f "$probe_body"
+
+  local start=0 resp found=""
+  while :; do
+    resp="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" \
+      "${BBS_BASE_URL}/rest/api/1.0/projects/${encP}/repos?limit=100&start=${start}" 2>/dev/null || true)"
+    [[ -z "$resp" ]] && break
+    found="$(printf '%s' "$resp" | jq -r --arg n "$value" '.values[]? | select((.name // "") == $n or ((.name // "") | ascii_downcase) == ($n | ascii_downcase)) | .slug' 2>/dev/null | head -n1 || true)"
+    [[ -n "$found" ]] && break
+    [[ "$(printf '%s' "$resp" | jq -r '.isLastPage' 2>/dev/null)" == "true" ]] && break
+    local nextStart; nextStart="$(printf '%s' "$resp" | jq -r '.nextPageStart // empty' 2>/dev/null)"
+    [[ -z "$nextStart" ]] && break
+    start="$nextStart"
+  done
+
+  if [[ -z "$found" ]]; then
+    local resp2
+    resp2="$(curl "${BBS_CURL_OPTS[@]}" -H "$(bbs_auth_header)" "${BBS_BASE_URL}/rest/api/1.0/repos?projectkey=${encP}&name=${encV}&limit=100" 2>/dev/null || true)"
+    if [[ -n "$resp2" ]]; then
+      found="$(printf '%s' "$resp2" | jq -r --arg n "$value" --arg pk "$projectKey" '.values[]? | select((((.project.key // "")|ascii_downcase)==($pk|ascii_downcase)) and (((.name // "")|ascii_downcase)==($n|ascii_downcase))) | .slug' 2>/dev/null | head -n1 || true)"
+    fi
+  fi
+
+  if [[ -n "$found" ]]; then
+    echo -e "\033[33m[WARNING] '${value}' is a repository NAME, not a slug. Resolved to slug '${found}' for ${projectKey}.\033[0m" >&2
+    SLUG_CACHE[$key]="$found"
+    printf '%s' "$found"
+    return 0
+  fi
+
+  printf '%s' "$value"
+  return 1
+}
 
 ############################################
 # Load queue from CSV rows (skip header)
@@ -378,14 +637,17 @@ LINE_NUM=0
 while IFS= read -r line; do
   ((LINE_NUM++)) || true
   [[ ${LINE_NUM} -eq 1 ]] && continue
+  if [[ -z "${line//[[:space:]]/}" ]]; then
+    continue
+  fi
 
   mapfile -t F < <(parse_csv_line "${line}")
-  projectKey="${F[${COLIDX[project-key]}]}"
-  projectName="${F[${COLIDX[project-name]}]}"
-  repoSlug="${F[${COLIDX[repo]}]}"
-  github_org="${F[${COLIDX[github_org]}]}"
-  github_repo="${F[${COLIDX[github_repo]}]}"
-  gh_repo_visibility="${F[${COLIDX[gh_repo_visibility]}]}"
+  projectKey="${F[${COLIDX[project-key]}]:-}"
+  projectName="${F[${COLIDX[project-name]}]:-}"
+  repoSlug="${F[${COLIDX[repo]}]:-}"
+  github_org="${F[${COLIDX[github_org]}]:-}"
+  github_repo="${F[${COLIDX[github_repo]}]:-}"
+  gh_repo_visibility="${F[${COLIDX[gh_repo_visibility]}]:-}"
 
   # Trim quotes
   projectKey="$(strip_quotes "$projectKey")"
@@ -402,6 +664,19 @@ while IFS= read -r line; do
     continue
   fi
 
+  if ! repoSlug="$(resolve_repo_slug "${projectKey}" "${repoSlug}")"; then
+    echo -e "[31m[ERROR] No repository in ${projectKey} matches the name or slug '${repoSlug}'.[0m"
+    echo -e "[31m[ERROR] Available in ${projectKey}: $(list_project_repos "${projectKey}")[0m"
+    NOT_FOUND+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+    continue
+  fi
+
+  if [[ -n "${LARGE_FILE_SKIP["${projectKey}/${repoSlug}"]:-}" ]]; then
+    echo "[WARNING] Skipping ${projectKey}/${repoSlug} -> ${github_org}/${github_repo}: contains large file(s) flagged by prechecks."
+    SKIPPED_LARGE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
+    continue
+  fi
+
   QUEUE+=("${projectKey}	${projectName}	${repoSlug}	${github_org}	${github_repo}	${gh_repo_visibility}")
 done < "${CSV_PATH}"
 
@@ -409,13 +684,24 @@ done < "${CSV_PATH}"
 # Initialize output CSV with Pending
 ############################################
 write_migration_status_csv_header
-for item in "${QUEUE[@]}"; do
+for item in ${QUEUE[@]+"${QUEUE[@]}"}; do
   IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
   append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Pending" ""
+done
+for item in ${SKIPPED_LARGE[@]+"${SKIPPED_LARGE[@]}"}; do
+  IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
+  append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Skipped - Large Files" ""
+done
+for item in ${NOT_FOUND[@]+"${NOT_FOUND[@]}"}; do
+  IFS=$'\t' read -r projectKey projectName repoSlug github_org github_repo gh_repo_visibility <<< "${item}"
+  append_status_row "${projectKey}" "${projectName}" "${repoSlug}" "${github_org}" "${github_repo}" "${gh_repo_visibility}" "Failure - Repo Not Found" ""
 done
 
 echo "[INFO] Starting migration with ${MAX_CONCURRENT} concurrent jobs..."
 echo "[INFO] Processing ${#QUEUE[@]} repositories from: ${CSV_PATH}"
+if (( ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "[INFO] Skipping ${#SKIPPED_LARGE[@]} repositories flagged with large files (deferred for Git LFS migration)."
+fi
 echo "[INFO] Initialized migration status output: ${OUTPUT_CSV_PATH}"
 
 ############################################
@@ -515,26 +801,45 @@ done
 echo
 echo "[INFO] All migrations completed."
 total_repos=$(( $(wc -l < "${CSV_PATH}") - 1 ))
-echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]}"
+echo "[SUMMARY] Total: ${total_repos} / Migrated: ${#MIGRATED[@]} / Failed: ${#FAILED[@]} / Skipped (large files): ${#SKIPPED_LARGE[@]} / Not found in Bitbucket: ${#NOT_FOUND[@]}"
+
+if (( ${#NOT_FOUND[@]} > 0 )); then
+  for item in "${NOT_FOUND[@]}"; do
+    IFS=$'\t' read -r pk _pn rs _go _gr _vis <<< "${item}"
+    echo "::error::repos.csv entry '${pk}/${rs}' matches no repository in Bitbucket - nothing was migrated for it."
+  done
+fi
 echo "[INFO] Wrote migration results with Migration_Status column: ${OUTPUT_CSV_PATH}"
+
+if (( ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "::warning::${#SKIPPED_LARGE[@]} repository(ies) were skipped because they contain large files. Convert them to Git LFS and re-run with MIGRATE_LARGE_FILE_REPOS=true."
+  for item in "${SKIPPED_LARGE[@]}"; do
+    IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
+    echo "::warning::Skipped (large files): ${gh_org}/${gh_repo} (${pk}/${rs})"
+  done
+fi
 
 ############################################
 # 3-way exit code + GitHub Actions annotations
 ############################################
-if (( ${#FAILED[@]} == 0 )); then
-  echo "::notice::All ${total_repos} repositories migrated successfully"
+if (( ${#MIGRATED[@]} == 0 && ${#FAILED[@]} == 0 && ${#SKIPPED_LARGE[@]} > 0 )); then
+  echo "::notice::No migrations were attempted - all ${#SKIPPED_LARGE[@]} repository(ies) were deliberately skipped due to large files."
   exit 0
 
 elif (( ${#MIGRATED[@]} == 0 )); then
-  echo "::error::All ${total_repos} repositories failed to migrate"
-  for item in "${FAILED[@]}"; do
+  echo "::error::No repositories were migrated successfully (0 succeeded out of ${total_repos})."
+  for item in ${FAILED[@]+"${FAILED[@]}"}; do
     IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
     echo "::error::Failed: ${gh_org}/${gh_repo} (${pk}/${rs})"
   done
   exit 1
 
+elif (( ${#FAILED[@]} == 0 )); then
+  echo "::notice::All ${#MIGRATED[@]} attempted repositories migrated successfully (${#SKIPPED_LARGE[@]} skipped, ${total_repos} in CSV)"
+  exit 0
+
 else
-  echo "::warning::Migration completed with partial success: ${#MIGRATED[@]} succeeded, ${#FAILED[@]} failed out of ${total_repos} total"
+  echo "::warning::Migration completed with partial success: ${#MIGRATED[@]} succeeded, ${#FAILED[@]} failed, ${#SKIPPED_LARGE[@]} skipped out of ${total_repos} total"
   for item in "${FAILED[@]}"; do
     IFS=$'\t' read -r pk _pn rs gh_org gh_repo _vis <<< "${item}"
     echo "::warning::Failed: ${gh_org}/${gh_repo} (${pk}/${rs})"
