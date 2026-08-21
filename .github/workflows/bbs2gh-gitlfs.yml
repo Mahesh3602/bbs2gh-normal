@@ -95,7 +95,6 @@ jobs:
         shell: bash
         env:
           BBS_BASE_URL: ${{ env.BBS_BASE_URL }}
-          BBS_PAT: ${{ secrets.BBS_PAT }}
           BBS_AUTH_TYPE: ${{ vars.BBS_AUTH_TYPE }}
           BBS_USERNAME: ${{ vars.BBS_USERNAME }}
           BBS_PASSWORD: ${{ secrets.BBS_PASSWORD }}
